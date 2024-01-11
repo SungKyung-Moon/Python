@@ -1,0 +1,124 @@
+WITH paub as (
+    SELECT metropolis.udf_parse_pageid(protocol, host, path, querystring, hashtag, page_value['is_iframe'], ins_date, user_agent, cast(pageid_info['meta_version'] as int)) as pa,
+            *
+    FROM default.ub_page_view_v2_gmkt_reg
+    WHERE dt >= ${dt1} and dt <= ${dt2}-- 조회일자
+        and length(cookie['cguid']) = 26
+        and session_id is not null
+)
+ 
+, paub_e as (
+    SELECT dt, area_code, area_type, area_value
+            , trim(default.udf_url_decode(
+                CASE WHEN page_value['original_keyword'] is not null THEN page_value['original_keyword']
+                    WHEN area_value['keyword'] is not null THEN area_value['keyword']
+                    WHEN querystring['keyword'] is not null THEN querystring['keyword']
+                    ELSE ''
+                END, 'utf-8')) as original_keyword
+            , trim(default.udf_url_decode(page_value['suggested_keyword'], 'utf-8')) as suggested_keyword
+             
+            , nvl(page_value['convert_type'], 0) as convert_type
+            , nvl(page_value['convert_reason_type'], 0) as convert_reason_type
+             
+ 
+    FROM default.ub_page_event_v2_gmkt_reg
+    WHERE dt >= ${dt1} and dt <= ${dt2}
+        and length(cookie['cguid']) = 26 --cguid 26자리인 것만
+        and session_id is not null
+        and lower(action) = 'click'
+)
+ 
+, raw1 as (
+    select dt
+        -- keyword
+        , trim(default.udf_url_decode(
+                CASE WHEN page_value['original_keyword'] is not null THEN page_value['original_keyword']
+                    WHEN querystring['keyword'] is not null THEN querystring['keyword']
+                    ELSE ''
+                END , 'utf-8')) as original_keyword
+        , trim(default.udf_url_decode(page_value['suggested_keyword'], 'utf-8')) as suggested_keyword
+        , nvl(page_value['convert_type'], 0) as convert_type
+        , nvl(page_value['convert_reason_type'], 0) as convert_reason_type
+         
+    FROM paub
+    WHERE pa.standard = true -- 표준 기준
+        and pa.depth1_name = 'LP/SRP'                   -- Depth1 명 (depth1명으로 집계시, LP/SRP)
+        and pa.depth2_name = 'SRP'               -- Depth2 명 (depth2명으로 집계시, SRP)
+)
+, keyword_data as (
+SELECT r.dt as dt
+    , r.original_keyword as original_keyword
+    , r.suggested_keyword as suggested_keyword
+    , CASE
+            WHEN (r.convert_type=100 and r.convert_reason_type=300) THEN 'Convert_Only_Replace'
+            WHEN (r.convert_type=100 and r.convert_reason_type=200) THEN 'Convert_Only_Correct'
+            WHEN (r.convert_type=200 and r.convert_reason_type=200) THEN 'Not_Convert_And_Suggest_Correct'
+            WHEN (r.convert_type=200 and r.convert_reason_type=300) THEN 'Not_Convert_And_Suggest_Replace'
+            WHEN (r.convert_type=101 and r.convert_reason_type=100) THEN 'Convert_And_Suggest_Language_Change'
+            WHEN (r.convert_type=101 and r.convert_reason_type=200) THEN 'Convert_And_Suggest_Correct'
+            WHEN (r.convert_type=0 and r.convert_reason_type=0) THEN 'Not_Convert'
+        END as Front
+    , r.pv_count as pv_count
+    , nvl(m.module_clicks, 0) module_clicks
+    , nvl(i.item_original_clicks, 0) item_original_clicks
+    , nvl(i.item_suggested_clicks, 0) item_suggested_clicks
+FROM (
+    SELECT a.dt as dt
+        , a.original_keyword as original_keyword
+        , a.suggested_keyword as suggested_keyword
+        , a.convert_type as convert_type
+        , a.convert_reason_type as convert_reason_type
+        , count(*) as pv_count
+    -- impression
+    FROM (
+        SELECT dt
+            , original_keyword
+            , nvl(suggested_keyword, original_keyword) suggested_keyword
+            , convert_type, convert_reason_type
+        FROM raw1
+        ) a
+    GROUP BY a.dt, a.original_keyword, a.suggested_keyword, a.convert_type, a.convert_reason_type
+) r
+ 
+LEFT JOIN (
+    -- 1. 모듈 자체에 대한 클릭
+    SELECT dt, original_keyword, suggested_keyword, convert_type, convert_reason_type
+        , count(*) as module_clicks -- clicks
+    FROM paub_e
+    WHERE area_code in ('200005369', '200005893', '200005370', '200005371')
+    GROUP BY dt, original_keyword, suggested_keyword, convert_type, convert_reason_type
+) m on r.dt=m.dt and r.original_keyword=m.original_keyword and r.suggested_keyword=m.suggested_keyword
+    and r.convert_type=m.convert_type and r.convert_reason_type=m.convert_reason_type
+     
+LEFT JOIN (
+    SELECT b.dt dt
+            , b.original_keyword as original_keyword
+            , b.suggested_keyword as suggested_keyword
+            , b.convert_type as convert_type
+            , b.convert_reason_type as convert_reason_type
+            , count(b.item_original) as item_original_clicks -- 2. 검색 키워드의 item 클릭 (200005893, 200005370, 200005371)
+            , count(b.item_suggested) as item_suggested_clicks -- 3. 전환 키워드 item 클릭 (200005369, 200005370, 200005371)
+    FROM (
+        SELECT dt, original_keyword, nvl(suggested_keyword, original_keyword) suggested_keyword
+                , convert_type, convert_reason_type
+            -- 2. 검색 키워드의 item 클릭 (200005893, 200005370, 200005371)
+            , case when area_value['tier']<>'10' then 1 else null END as item_original -- SRP Core
+            -- 3. 전환 키워드 item 클릭 (200005369, 200005370, 200005371)
+            , case when area_value['tier']='10' then 1 else null END as item_suggested
+        FROM paub_e
+        WHERE lower(area_type)='item'
+        ) b
+    GROUP BY b.dt, b.original_keyword, b.suggested_keyword, b.convert_type, b.convert_reason_type
+ 
+) i on r.dt=i.dt and r.original_keyword=i.original_keyword and r.suggested_keyword=i.suggested_keyword
+    and r.convert_type=i.convert_type and r.convert_reason_type=i.convert_reason_type
+WHERE (r.convert_type<>0 and r.convert_reason_type<>0)  -- ★ Not Convert 제외
+)
+select front,
+count(distinct original_keyword) as keyword_cnt,
+round(sum(pv_count)/(${dt2}-${dt1}+1),1) as pv_count_avg ,
+round(sum(module_clicks)/(${dt2}-${dt1}+1),1) as module_clicks_avg, 
+round(sum(item_original_clicks)/(${dt2}-${dt1}+1),1) as item_original_clicks_avg,
+round(sum(item_suggested_clicks)/(${dt2}-${dt1}+1),1) as item_suggested_clicks_avg
+from keyword_data
+group by front
